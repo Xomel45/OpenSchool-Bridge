@@ -7,8 +7,22 @@ use crate::error::BridgeError;
 use crate::models::{ClassInfo, Student, Week};
 
 const DEFAULT_BASE_URL: &str = "https://www.gosuslugi.ru";
-/// An honest client identifier; we do not pretend to be a browser.
-const USER_AGENT: &str = concat!("OpenSchool/", env!("CARGO_PKG_VERSION"), " (+https://github.com/Xomel45/OpenSchool-Bridge)");
+/// The OS family the bridge was built for: only the family, no version or device (that would be a fingerprint).
+#[cfg(target_os = "android")]
+macro_rules! platform { () => { "Android" }; }
+#[cfg(target_os = "windows")]
+macro_rules! platform { () => { "Windows" }; }
+#[cfg(target_os = "linux")]
+macro_rules! platform { () => { "Linux" }; }
+#[cfg(target_os = "macos")]
+macro_rules! platform { () => { "macOS" }; }
+#[cfg(target_os = "ios")]
+macro_rules! platform { () => { "iOS" }; }
+#[cfg(not(any(target_os = "android", target_os = "windows", target_os = "linux", target_os = "macos", target_os = "ios")))]
+macro_rules! platform { () => { "Unknown" }; }
+
+/// An honest client identifier, `OpenSchool/<version> (<OS family>; +<repository>)`; we do not pretend to be a browser.
+const USER_AGENT: &str = concat!("OpenSchool/", env!("CARGO_PKG_VERSION"), " (", platform!(), "; +https://github.com/Xomel45/OpenSchool-Bridge)");
 
 /// Where a UI should send the user to log in: Gosuslugi redirects to ESIA and, once the user is
 /// authenticated, lands back on the diary.
@@ -170,6 +184,15 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn user_agent_names_the_product_version_and_os_family_only() {
+        let os = if cfg!(target_os = "linux") { "Linux" } else if cfg!(target_os = "windows") { "Windows" } else if cfg!(target_os = "android") { "Android" } else { "" };
+        if !os.is_empty() {
+            assert_eq!(super::USER_AGENT, format!("OpenSchool/{} ({os}; +https://github.com/Xomel45/OpenSchool-Bridge)", env!("CARGO_PKG_VERSION")));
+        }
+        assert!(!super::USER_AGENT.contains("Mozilla"));
+    }
+
     use super::*;
 
     #[test]
