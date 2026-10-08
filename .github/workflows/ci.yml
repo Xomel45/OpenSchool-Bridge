@@ -18,7 +18,7 @@ jobs:
           - { name: windows-x64, os: windows-latest, target: x86_64-pc-windows-msvc,   experimental: false }
           - { name: windows-x86, os: windows-latest, target: i686-pc-windows-msvc,     experimental: true }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
