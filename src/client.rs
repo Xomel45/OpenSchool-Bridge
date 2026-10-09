@@ -35,6 +35,13 @@ pub struct SessionCookie {
     pub value: String,
 }
 
+/// A cookie we are willing to send: a name, and no `;` or line breaks in either part (they would become cookie attributes
+/// or extra headers).
+fn plain_cookie(c: &SessionCookie) -> bool {
+    let bad = |s: &str| s.contains([';', '\r', '\n']);
+    !c.name.is_empty() && !bad(&c.name) && !bad(&c.value)
+}
+
 /// Split a `Cookie`-style header (`"a=1; b=2"`, as returned by Android's `CookieManager`).
 /// Malformed pieces are skipped.
 fn parse_cookie_header(header: &str) -> Vec<SessionCookie> {
@@ -76,17 +83,29 @@ fn check_year(year: u32) -> Result<(), BridgeError> {
     if (2000..=2100).contains(&year) { Ok(()) } else { Err(BridgeError::Parse(format!("invalid year {year}"))) }
 }
 
-/// ISO weeks run 1..=53.
+/// 52 or 53: a year has 53 ISO weeks when 1 January is a Thursday, or a Wednesday in a leap year.
+fn iso_weeks_in(year: u32) -> u32 {
+    let p = |y: u32| (y + y / 4 - y / 100 + y / 400) % 7;
+    if p(year) == 4 || p(year.saturating_sub(1)) == 3 { 53 } else { 52 }
+}
+
 fn check_week(year: u32, iso_week: u32) -> Result<(), BridgeError> {
     check_year(year)?;
-    if (1..=53).contains(&iso_week) { Ok(()) } else { Err(BridgeError::Parse(format!("invalid week {iso_week} of {year}"))) }
+    if (1..=iso_weeks_in(year)).contains(&iso_week) { Ok(()) } else { Err(BridgeError::Parse(format!("invalid week {iso_week} of {year}"))) }
 }
 
 fn build_client(base_url: &str, user_agent: Option<&str>) -> Result<Client, BridgeError> {
     let base_url = reqwest::Url::parse(base_url).map_err(|e| BridgeError::Network(e.to_string()))?;
     check_base_url(&base_url)?;
+    // A dead session may answer with a redirect to the login page instead of a 401. Redirects inside the service are
+    // followed, one that leaves it is not (the 3xx answer then counts as "session rejected", see `Client::body`),
+    // so the login page's HTML is never mistaken for data and the cookies never travel to a foreign host.
+    let home = base_url.host_str().unwrap_or_default().to_string();
+    let redirects = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.url().host_str() == Some(home.as_str()) && attempt.previous().len() < 5 { attempt.follow() } else { attempt.stop() }
+    });
     let jar = Arc::new(Jar::default());
-    let mut builder = reqwest::Client::builder().cookie_provider(jar.clone()).connect_timeout(CONNECT_TIMEOUT).timeout(REQUEST_TIMEOUT);
+    let mut builder = reqwest::Client::builder().cookie_provider(jar.clone()).redirect(redirects).connect_timeout(CONNECT_TIMEOUT).timeout(REQUEST_TIMEOUT);
     // An empty string means "send no User-Agent header at all".
     match user_agent.unwrap_or(USER_AGENT) {
         "" => {}
@@ -119,14 +138,14 @@ impl Client {
 
     /// Install the session obtained by the UI (WebView on mobile, browser on desktop).
     pub fn set_session(&self, cookies: Vec<SessionCookie>) {
-        for c in cookies {
+        for c in cookies.into_iter().filter(plain_cookie) {
             self.jar.add_cookie_str(&format!("{}={}; Path=/", c.name, c.value), &self.base_url);
         }
     }
 
     /// Same as `set_session`, from a raw `Cookie` header string. Returns how many cookies were set.
     pub fn set_session_from_header(&self, header: String) -> u32 {
-        let cookies = parse_cookie_header(&header);
+        let cookies: Vec<SessionCookie> = parse_cookie_header(&header).into_iter().filter(plain_cookie).collect();
         let n = cookies.len() as u32;
         self.set_session(cookies);
         n
@@ -185,7 +204,9 @@ impl Client {
 impl Client {
     async fn body(resp: reqwest::Response) -> Result<String, BridgeError> {
         let status = resp.status();
-        if status == 401 || status == 403 {
+        // 401/403, or a redirect that was not followed (to the login page): the session is not accepted.
+        // (A 403 can in principle also come from a firewall; the status stays in the message for diagnosis.)
+        if status == 401 || status == 403 || status.is_redirection() {
             return Err(BridgeError::Auth(format!("HTTP {status}")));
         }
         if !status.is_success() {
@@ -282,9 +303,36 @@ mod tests {
         for (year, week) in [(2026, 0), (2026, 54), (2026, 99), (1999, 10), (2101, 10)] {
             assert!(matches!(client.week("s".into(), year, week).await, Err(BridgeError::Parse(_))), "{year} week {week}");
         }
-        assert!(matches!(client.week("s".into(), 2026, 53).await, Err(BridgeError::Network(_))), "week 53 is valid, so the request is attempted");
+        assert!(matches!(client.week("s".into(), 2026, 53).await, Err(BridgeError::Network(_))), "2026 has 53 weeks, so the request is attempted");
+        assert!(matches!(client.week("s".into(), 2025, 53).await, Err(BridgeError::Parse(_))), "2025 has only 52");
         assert!(matches!(client.class_info("s".into(), 1999).await, Err(BridgeError::Parse(_))));
         assert!(matches!(client.class_info("s".into(), 2026).await, Err(BridgeError::Network(_))));
+    }
+
+    #[test]
+    fn iso_week_counts_match_the_calendar() {
+        // known 53-week years: 2015, 2020, 2026; 52-week: 2021-2025, 2027
+        assert_eq!([2015, 2020, 2026].map(iso_weeks_in), [53, 53, 53]);
+        assert_eq!([2021, 2022, 2023, 2024, 2025, 2027].map(iso_weeks_in), [52; 6]);
+    }
+
+    #[test]
+    fn cookies_that_would_break_out_of_their_value_are_not_sent() {
+        let c = Client::new().unwrap();
+        assert_eq!(c.set_session_from_header("a=1; b=x\r\nInjected: 1; ok=2".into()), 2);
+        let bad = |n: &str, v: &str| plain_cookie(&SessionCookie { name: n.into(), value: v.into() });
+        assert!(bad("a", "b"));
+        assert!(!bad("a", "b; Domain=evil.example"));
+        assert!(!bad("", "b"));
+        assert!(!bad("a\nb", "c"));
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_the_login_page_counts_as_a_rejected_session() {
+        // the "service" answers every request with a 302 to another host (the ESIA login)
+        let redirected = Client::with_base_url(serve("302 Found\r\nLocation: http://login.invalid/auth", "")).unwrap();
+        assert!(!redirected.check_session().await.unwrap(), "a redirect off the service means: log in again, not a Parse error");
+        assert!(matches!(redirected.students().await, Err(BridgeError::Auth(_))));
     }
 
     #[test]

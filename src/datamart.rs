@@ -33,10 +33,22 @@ pub(crate) fn class_queries(student_id: &str, year: u32) -> Vec<Query<'_>> {
     vec![Query { interval_id: year.to_string(), obj_type: "student_classes", student_id }]
 }
 
+/// The server sends `null` as often as it leaves a field out; for text and lists both mean "empty".
+/// (`#[serde(default)]` alone only covers a missing field: one `null` would fail the whole week.)
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 #[derive(Deserialize)]
 struct Item {
     obj_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
+    interval_id: String,
+    #[serde(default, deserialize_with = "null_default")]
     data: Vec<serde_json::Value>,
 }
 
@@ -49,7 +61,7 @@ fn rows<T: serde::de::DeserializeOwned>(items: &[Item], obj_type: &str) -> Resul
         .iter()
         .filter(|i| i.obj_type == obj_type)
         .flat_map(|i| i.data.iter())
-        .map(|v| serde_json::from_value(v.clone()).map_err(|e| BridgeError::Parse(e.to_string())))
+        .map(|v| T::deserialize(v).map_err(|e| BridgeError::Parse(e.to_string())))
         .collect()
 }
 
@@ -62,13 +74,13 @@ fn clean_dt(s: &str) -> String {
 struct RawLesson {
     lesson_id: String,
     subject_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     subject_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     firstname: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     lastname: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     patronymic: String,
     start_datetime: String,
     end_datetime: String,
@@ -83,9 +95,9 @@ struct RawLesson {
 
 #[derive(Deserialize)]
 struct RawMaterial {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     link: String,
 }
 
@@ -93,15 +105,15 @@ struct RawMaterial {
 struct RawHomework {
     homeworks_id: String,
     subject_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     subject_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     description: String,
     issue_date: String,
     plan_ready_date: String,
     #[serde(default)]
     ready_lesson_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     materials: Vec<RawMaterial>,
 }
 
@@ -109,14 +121,14 @@ struct RawHomework {
 struct RawMark {
     marks_id: String,
     subject_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     subject_name: String,
     mark_value1: String,
     mark_value2: Option<String>,
     mark_date: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     work_type_code: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     work_type_description: String,
     work_name: Option<String>,
     comment: Option<String>,
@@ -136,19 +148,23 @@ struct RawPeriod {
 
 #[derive(Deserialize)]
 struct RawClass {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     short_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     class_num: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     class_letter: String,
     academ_year: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     periods: Vec<RawPeriod>,
 }
 
 pub(crate) fn parse_week(body: &str, year: u32, iso_week: u32) -> Result<Week, BridgeError> {
-    let items = items(body)?;
+    let mut items = items(body)?;
+    // The reply may carry neighbouring weeks too, in any order, sometimes as thinner copies of the same lessons.
+    // De-duplication keeps the first copy it meets, so put the week that was asked for first (the sort is stable).
+    let own = week_interval(year, iso_week);
+    items.sort_by_key(|i| i.interval_id != own);
 
     // A neighbouring week's interval may repeat lessons, so de-duplicate by id.
     let mut seen = HashSet::new();
@@ -216,13 +232,13 @@ pub(crate) fn parse_week(body: &str, year: u32, iso_week: u32) -> Result<Week, B
 #[derive(Deserialize)]
 struct RawStudent {
     student_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     student_first_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     student_last_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     student_middle_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     student_region: String,
 }
 
@@ -287,6 +303,42 @@ mod tests {
         {"homeworks_id":"H1","subject_id":null,"subject_name":"","description":"read p.5","issue_date":"2026-10-05","plan_ready_date":"2026-10-07","ready_lesson_id":"L2",
          "materials":[{"name":"a.docx","link":"https://example.test/a"}]}]}
     ]"#;
+
+    #[test]
+    fn the_asked_for_week_wins_over_a_thinner_copy_that_arrives_first() {
+        // the neighbouring week (422026) comes first and lacks the teacher and the absence of L1
+        let body = r#"[
+          {"obj_type":"student_lessons","interval_id":"422026","data":[
+            {"lesson_id":"L1","subject_id":"S2","subject_name":"Art","start_datetime":"2026-10-05 09:00:00.0","end_datetime":"2026-10-05 09:40:00.0"}]},
+          {"obj_type":"student_lessons","interval_id":"412026","data":[
+            {"lesson_id":"L1","subject_id":"S2","subject_name":"Art","firstname":"Bob","lastname":"Roe","patronymic":"Y",
+             "start_datetime":"2026-10-05 09:00:00.0","end_datetime":"2026-10-05 09:40:00.0","skipping_id":"K1","type_code":"notallowded","type_description":"No reason"}]}
+        ]"#;
+        let w = parse_week(body, 2026, 41).unwrap();
+        assert_eq!(w.lessons.len(), 1);
+        assert_eq!(w.lessons[0].teacher.last_name, "Roe");
+        assert!(w.lessons[0].absence.is_some(), "the absence must survive, whatever the order of the reply");
+    }
+
+    #[test]
+    fn null_in_a_text_field_does_not_fail_the_whole_week() {
+        let body = r#"[
+          {"obj_type":"student_lessons","interval_id":"412026","data":[
+            {"lesson_id":"L1","subject_id":null,"subject_name":null,"firstname":null,"lastname":null,"patronymic":null,
+             "start_datetime":"2026-10-05 09:00:00.0","end_datetime":"2026-10-05 09:40:00.0"}]},
+          {"obj_type":"student_homeworks_materials","interval_id":"412026","data":[
+            {"homeworks_id":"H1","subject_name":null,"description":null,"issue_date":"2026-10-05","plan_ready_date":"2026-10-07","materials":null},
+            {"homeworks_id":"H2","subject_name":"Art","description":"x","issue_date":"2026-10-05","plan_ready_date":"2026-10-07","materials":[{"name":null,"link":null}]}]},
+          {"obj_type":"student_marks","interval_id":"412026","data":[
+            {"marks_id":"M1","subject_name":null,"mark_value1":"5","mark_date":"2026-10-05","work_type_code":null,"work_type_description":null}]}
+        ]"#;
+        let w = parse_week(body, 2026, 41).unwrap();
+        assert_eq!((w.lessons.len(), w.homeworks.len(), w.marks.len()), (1, 2, 1));
+        assert_eq!(w.lessons[0].teacher.last_name, "");
+        assert!(w.homeworks[0].materials.is_empty());
+        let students = parse_students(r#"[{"student_id":"1","student_first_name":null,"student_last_name":"Doe","student_middle_name":null,"student_region":null}]"#).unwrap();
+        assert_eq!((students[0].first_name.as_str(), students[0].last_name.as_str()), ("", "Doe"));
+    }
 
     #[test]
     fn parses_and_dedupes_marks() {
