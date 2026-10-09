@@ -94,7 +94,20 @@ fn check_week(year: u32, iso_week: u32) -> Result<(), BridgeError> {
     if (1..=iso_weeks_in(year)).contains(&iso_week) { Ok(()) } else { Err(BridgeError::Parse(format!("invalid week {iso_week} of {year}"))) }
 }
 
-fn build_client(base_url: &str, user_agent: Option<&str>) -> Result<Client, BridgeError> {
+/// Services that tell the caller its country. Plain https, no keys. Order = preference.
+const GEO_SERVICES: [&str; 3] = ["https://ipinfo.io/country", "https://ipapi.co/country/", "https://api.country.is/"];
+
+/// `{"ip":"..","country":"DE"}` or a bare `DE` (surrounding whitespace allowed) -> `DE`.
+fn parse_country(text: &str) -> Option<String> {
+    let t = text.trim();
+    let code = match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(v) => v.get("country").and_then(|c| c.as_str()).map(str::to_string)?,
+        Err(_) => t.to_string(),
+    };
+    (code.len() == 2 && code.chars().all(|c| c.is_ascii_alphabetic())).then(|| code.to_ascii_uppercase())
+}
+
+fn build_client(base_url: &str, user_agent: Option<&str>, direct: bool) -> Result<Client, BridgeError> {
     let base_url = reqwest::Url::parse(base_url).map_err(|e| BridgeError::Network(e.to_string()))?;
     check_base_url(&base_url)?;
     // A dead session may answer with a redirect to the login page instead of a 401. Redirects inside the service are
@@ -106,6 +119,10 @@ fn build_client(base_url: &str, user_agent: Option<&str>) -> Result<Client, Brid
     });
     let jar = Arc::new(Jar::default());
     let mut builder = reqwest::Client::builder().cookie_provider(jar.clone()).redirect(redirects).connect_timeout(CONNECT_TIMEOUT).timeout(REQUEST_TIMEOUT);
+    if direct {
+        // Ignore the proxy settings of the system and of the environment: a foreign proxy makes Gosuslugi refuse everything.
+        builder = builder.no_proxy();
+    }
     // An empty string means "send no User-Agent header at all".
     match user_agent.unwrap_or(USER_AGENT) {
         "" => {}
@@ -121,19 +138,67 @@ fn build_client(base_url: &str, user_agent: Option<&str>) -> Result<Client, Brid
 impl Client {
     #[uniffi::constructor]
     pub fn new() -> Result<Self, BridgeError> {
-        build_client(DEFAULT_BASE_URL, None)
+        build_client(DEFAULT_BASE_URL, None, false)
     }
 
     /// Same as `new`, but against another host (mock server in tests).
     #[uniffi::constructor]
     pub fn with_base_url(base_url: String) -> Result<Self, BridgeError> {
-        build_client(&base_url, None)
+        build_client(&base_url, None, false)
     }
 
     /// Override the `User-Agent` header (`""` sends none). For diagnosing server-side filtering.
     #[uniffi::constructor]
     pub fn with_user_agent(user_agent: String) -> Result<Self, BridgeError> {
-        build_client(DEFAULT_BASE_URL, Some(&user_agent))
+        build_client(DEFAULT_BASE_URL, Some(&user_agent), false)
+    }
+
+    /// Like `new`, but connects straight to the server and ignores any proxy configured in the system or the environment.
+    #[uniffi::constructor]
+    pub fn direct() -> Result<Self, BridgeError> {
+        build_client(DEFAULT_BASE_URL, None, true)
+    }
+
+    /// `with_base_url` that ignores proxies (for tests).
+    #[uniffi::constructor]
+    pub fn with_base_url_direct(base_url: String) -> Result<Self, BridgeError> {
+        build_client(&base_url, None, true)
+    }
+
+    /// Whether the server can be reached from here, and what it says to an anonymous request: the HTTP status
+    /// (401 is the normal answer without a session). A transport failure is an error. Used to find out if a proxy
+    /// in between breaks the connection (Gosuslugi refuses foreign addresses).
+    pub async fn probe(&self) -> Result<u16, BridgeError> {
+        let mut url = self.base_url.join("/api/myschool/v2/auth/student").map_err(|e| BridgeError::Network(e.to_string()))?;
+        url.query_pairs_mut().append_pair("role", "student");
+        let resp = self.http.get(url).header(reqwest::header::ACCEPT, "application/json").send().await.map_err(|e| BridgeError::Network(e.to_string()))?;
+        Ok(resp.status().as_u16())
+    }
+
+    /// Two-letter country code (upper case) of the address this client's traffic leaves from, so a proxy abroad can be told from
+    /// a local one. Asks public "what is my country" services, one after another, through the client's own route (its proxy included).
+    pub async fn exit_country(&self) -> Result<String, BridgeError> {
+        self.exit_country_from(GEO_SERVICES.iter().map(|s| s.to_string()).collect()).await
+    }
+
+    /// `exit_country` against the given service URLs (they answer JSON with a `country` field, or the bare code as text).
+    pub async fn exit_country_from(&self, services: Vec<String>) -> Result<String, BridgeError> {
+        let mut last = BridgeError::Network("no geo service".into());
+        for url in services {
+            let attempt = async {
+                let resp = self.http.get(&url).send().await.map_err(|e| BridgeError::Network(e.to_string()))?;
+                if !resp.status().is_success() {
+                    return Err(BridgeError::Network(format!("HTTP {}", resp.status())));
+                }
+                let text = resp.text().await.map_err(|e| BridgeError::Network(e.to_string()))?;
+                parse_country(&text).ok_or_else(|| BridgeError::Parse("no country in the answer".into()))
+            };
+            match attempt.await {
+                Ok(code) => return Ok(code),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
     }
 
     /// Install the session obtained by the UI (WebView on mobile, browser on desktop).
@@ -295,6 +360,31 @@ mod tests {
         assert!(no_students.check_session().await.unwrap(), "the server accepted the session even though no student is linked");
         let broken = Client::with_base_url(serve("500 Internal Server Error", "oops")).unwrap();
         assert!(broken.check_session().await.is_err(), "a server error is an error, not an answer about the session");
+    }
+
+    #[test]
+    fn country_answers_in_both_shapes_and_nothing_else_passes() {
+        assert_eq!(parse_country(r#"{"ip":"1.2.3.4","country":"de"}"#).as_deref(), Some("DE"));
+        assert_eq!(parse_country("RU\n").as_deref(), Some("RU"));
+        for bad in ["", "Russia", "<html>blocked</html>", r#"{"country":"RUS"}"#, r#"{"ip":"1"}"#, "R1"] {
+            assert_eq!(parse_country(bad), None, "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn exit_country_skips_a_broken_service_and_fails_when_all_are_broken() {
+        let c = Client::with_base_url("http://127.0.0.1:1".into()).unwrap();
+        let got = c.exit_country_from(vec!["http://127.0.0.1:1/".into(), serve("500 Oops", "x"), serve("200 OK", "junk text"), serve("200 OK", r#"{"country":"NL"}"#)]).await;
+        assert_eq!(got.unwrap(), "NL");
+        assert!(c.exit_country_from(vec![serve("200 OK", "junk text"), "http://127.0.0.1:1/".into()]).await.is_err());
+        assert!(c.exit_country_from(vec![]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn probe_reports_the_status_and_fails_on_a_dead_port() {
+        assert_eq!(Client::with_base_url(serve("401 Unauthorized", "")).unwrap().probe().await.unwrap(), 401);
+        assert_eq!(Client::with_base_url(serve("403 Forbidden", "")).unwrap().probe().await.unwrap(), 403);
+        assert!(Client::with_base_url("http://127.0.0.1:1".into()).unwrap().probe().await.is_err());
     }
 
     #[tokio::test]
