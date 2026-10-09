@@ -56,8 +56,28 @@ pub struct Client {
     base_url: reqwest::Url,
 }
 
+/// The session cookies go wherever this URL points, so it must be https; plain http only for a server on this machine (tests).
+fn check_base_url(url: &reqwest::Url) -> Result<(), BridgeError> {
+    let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if local => Ok(()),
+        _ => Err(BridgeError::Network("base URL must use https (http is allowed only for localhost)".into())),
+    }
+}
+
+/// ISO weeks run 1..=53; the year bound only rejects obvious garbage before it reaches the server.
+fn check_week(year: u32, iso_week: u32) -> Result<(), BridgeError> {
+    if (1..=53).contains(&iso_week) && (2000..=2100).contains(&year) {
+        Ok(())
+    } else {
+        Err(BridgeError::Parse(format!("invalid week {iso_week} of {year}")))
+    }
+}
+
 fn build_client(base_url: &str, user_agent: Option<&str>) -> Result<Client, BridgeError> {
     let base_url = reqwest::Url::parse(base_url).map_err(|e| BridgeError::Network(e.to_string()))?;
+    check_base_url(&base_url)?;
     let jar = Arc::new(Jar::default());
     let mut builder = reqwest::Client::builder().cookie_provider(jar.clone());
     // An empty string means "send no User-Agent header at all".
@@ -140,6 +160,7 @@ impl Client {
 
     /// Lessons, homework and marks for one ISO week.
     pub async fn week(&self, student_id: String, year: u32, iso_week: u32) -> Result<Week, BridgeError> {
+        check_week(year, iso_week)?;
         let body = self.datamart(&datamart::week_queries(&student_id, year, iso_week)).await?;
         datamart::parse_week(&body, year, iso_week)
     }
@@ -194,6 +215,26 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn session_cookies_only_go_to_https_or_a_local_test_server() {
+        assert!(Client::with_base_url("https://www.gosuslugi.ru".into()).is_ok());
+        assert!(Client::with_base_url("http://127.0.0.1:8080".into()).is_ok());
+        assert!(Client::with_base_url("http://localhost:1".into()).is_ok());
+        assert!(Client::with_base_url("http://evil.example".into()).is_err(), "plain http to a remote host");
+        assert!(Client::with_base_url("http://127.0.0.1.evil.example".into()).is_err(), "look-alike host");
+        assert!(Client::with_base_url("ftp://example.com".into()).is_err());
+        assert!(Client::with_base_url("not a url".into()).is_err());
+    }
+
+    #[tokio::test]
+    async fn impossible_weeks_are_refused_before_any_request() {
+        let client = Client::with_base_url("http://127.0.0.1:1".into()).unwrap(); // nothing listens there: a request would be a Network error
+        for (year, week) in [(2026, 0), (2026, 54), (2026, 99), (1999, 10), (2101, 10)] {
+            assert!(matches!(client.week("s".into(), year, week).await, Err(BridgeError::Parse(_))), "{year} week {week}");
+        }
+        assert!(matches!(client.week("s".into(), 2026, 53).await, Err(BridgeError::Network(_))), "week 53 is valid, so the request is attempted");
+    }
 
     #[test]
     fn cookie_header_is_split_and_trimmed() {
