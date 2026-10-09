@@ -56,6 +56,11 @@ pub struct Client {
     base_url: reqwest::Url,
 }
 
+/// A dead or stalled connection must end with an error, not with a spinner that never stops.
+/// (Tests use a short limit.)
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const REQUEST_TIMEOUT: std::time::Duration = if cfg!(test) { std::time::Duration::from_millis(400) } else { std::time::Duration::from_secs(30) };
+
 /// The session cookies go wherever this URL points, so it must be https; plain http only for a server on this machine (tests).
 fn check_base_url(url: &reqwest::Url) -> Result<(), BridgeError> {
     let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
@@ -66,20 +71,22 @@ fn check_base_url(url: &reqwest::Url) -> Result<(), BridgeError> {
     }
 }
 
-/// ISO weeks run 1..=53; the year bound only rejects obvious garbage before it reaches the server.
+/// The year bound only rejects obvious garbage before it reaches the server.
+fn check_year(year: u32) -> Result<(), BridgeError> {
+    if (2000..=2100).contains(&year) { Ok(()) } else { Err(BridgeError::Parse(format!("invalid year {year}"))) }
+}
+
+/// ISO weeks run 1..=53.
 fn check_week(year: u32, iso_week: u32) -> Result<(), BridgeError> {
-    if (1..=53).contains(&iso_week) && (2000..=2100).contains(&year) {
-        Ok(())
-    } else {
-        Err(BridgeError::Parse(format!("invalid week {iso_week} of {year}")))
-    }
+    check_year(year)?;
+    if (1..=53).contains(&iso_week) { Ok(()) } else { Err(BridgeError::Parse(format!("invalid week {iso_week} of {year}"))) }
 }
 
 fn build_client(base_url: &str, user_agent: Option<&str>) -> Result<Client, BridgeError> {
     let base_url = reqwest::Url::parse(base_url).map_err(|e| BridgeError::Network(e.to_string()))?;
     check_base_url(&base_url)?;
     let jar = Arc::new(Jar::default());
-    let mut builder = reqwest::Client::builder().cookie_provider(jar.clone());
+    let mut builder = reqwest::Client::builder().cookie_provider(jar.clone()).connect_timeout(CONNECT_TIMEOUT).timeout(REQUEST_TIMEOUT);
     // An empty string means "send no User-Agent header at all".
     match user_agent.unwrap_or(USER_AGENT) {
         "" => {}
@@ -129,7 +136,9 @@ impl Client {
     /// expired (the UI should then run the login flow again). Other failures are errors.
     pub async fn check_session(&self) -> Result<bool, BridgeError> {
         match self.students().await {
-            Ok(students) => Ok(!students.is_empty()),
+            // The server accepted the session. An account without a linked student is still a valid session: the caller
+            // should say "no student", not send the user round the login again.
+            Ok(_) => Ok(true),
             Err(BridgeError::Auth(_)) => Ok(false),
             Err(e) => Err(e),
         }
@@ -167,6 +176,7 @@ impl Client {
 
     /// Class, school and quarter dates for the academic year.
     pub async fn class_info(&self, student_id: String, year: u32) -> Result<Option<ClassInfo>, BridgeError> {
+        check_year(year)?;
         let body = self.datamart(&datamart::class_queries(&student_id, year)).await?;
         datamart::parse_class(&body)
     }
@@ -228,12 +238,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_server_that_never_answers_ends_in_an_error_not_a_hang() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _held = std::thread::spawn(move || listener.accept().map(|(s, _)| { std::thread::sleep(std::time::Duration::from_secs(5)); s }));
+        let client = Client::with_base_url(format!("http://127.0.0.1:{port}")).unwrap();
+        let started = std::time::Instant::now();
+        let r = client.students().await;
+        assert!(matches!(r, Err(BridgeError::Network(_))), "{r:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "took {:?}", started.elapsed());
+    }
+
+    /// A one-shot HTTP server that answers every connection with `status` and `body`.
+    fn serve(status: &str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let status = status.to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn check_session_tells_a_rejected_session_from_an_account_without_students() {
+        let rejected = Client::with_base_url(serve("401 Unauthorized", "")).unwrap();
+        assert!(!rejected.check_session().await.unwrap(), "401: not logged in");
+        let no_students = Client::with_base_url(serve("200 OK", "[]")).unwrap();
+        assert!(no_students.check_session().await.unwrap(), "the server accepted the session even though no student is linked");
+        let broken = Client::with_base_url(serve("500 Internal Server Error", "oops")).unwrap();
+        assert!(broken.check_session().await.is_err(), "a server error is an error, not an answer about the session");
+    }
+
+    #[tokio::test]
     async fn impossible_weeks_are_refused_before_any_request() {
         let client = Client::with_base_url("http://127.0.0.1:1".into()).unwrap(); // nothing listens there: a request would be a Network error
         for (year, week) in [(2026, 0), (2026, 54), (2026, 99), (1999, 10), (2101, 10)] {
             assert!(matches!(client.week("s".into(), year, week).await, Err(BridgeError::Parse(_))), "{year} week {week}");
         }
         assert!(matches!(client.week("s".into(), 2026, 53).await, Err(BridgeError::Network(_))), "week 53 is valid, so the request is attempted");
+        assert!(matches!(client.class_info("s".into(), 1999).await, Err(BridgeError::Parse(_))));
+        assert!(matches!(client.class_info("s".into(), 2026).await, Err(BridgeError::Network(_))));
     }
 
     #[test]
