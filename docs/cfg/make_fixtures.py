@@ -18,7 +18,7 @@ def cfg(**kw):
 
 os.makedirs(OUT, exist_ok=True)
 FULL = dict(
-    style="sunrise", scheme="dark", accent="#B04199", zoom=1.15,
+    style="sunrise", scheme="dark", accent="#B04199", zoom=1.15, icon="dusk",
     bg={"mode": "gradient", "kind": "image", "color": "#E2E8F0", "a": "#FF9966", "b": "#5B86E5", "angle": 120, "dim": 40, "blur": 3},
     notifications={"marks": True, "homework": False, "absences": True, "interval_min": 5, "detail": False},
     network={"mode": "direct"},
@@ -28,7 +28,7 @@ build("full.cfg", [("config.json", cfg(**FULL))])
 build("with-image.cfg", [("config.json", cfg(**{**FULL, "bg": {**FULL["bg"], "mode": "media", "kind": "image"}})), ("background.png", PNG)])
 build("with-video.cfg", [("config.json", cfg(**{**FULL, "bg": {**FULL["bg"], "mode": "media", "kind": "video"}})), ("background.mp4", MP4)])
 # values that must be skipped, entries that must be ignored; what is valid next to them still applies
-HOSTILE = dict(style="nope", scheme=7, accent="red", zoom=9, bg={"mode": "x", "color": "red", "dim": 500, "blur": -4},
+HOSTILE = dict(style="nope", scheme=7, accent="red", zoom=9, icon="evil", bg={"mode": "x", "color": "red", "dim": 500, "blur": -4},
                notifications={"marks": "yes", "interval_min": 7, "detail": False}, network={"mode": "teleport"}, surprise={"a": 1})
 build("hostile.cfg", [("../evil.sh", b"x"), ("config.json", cfg(**HOSTILE)), ("sub/config.json", b'{"format":"other"}'), ("background.exe", b"x"), ("notes.txt", b"hi")])
 

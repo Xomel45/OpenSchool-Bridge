@@ -30,6 +30,7 @@ ZIP-архив. Для чтения важны только два имени з
   "scheme": "system",
   "accent": "blue",
   "zoom": 1.15,
+  "icon": "graphite",
   "bg": { "mode": "media", "kind": "image", "color": "#E2E8F0", "a": "#FF9966", "b": "#FF5E62", "angle": 160, "dim": 35, "blur": 0 },
   "notifications": { "marks": true, "homework": true, "absences": false, "interval_min": 15, "detail": true },
   "network": { "mode": "auto" }
@@ -44,6 +45,7 @@ ZIP-архив. Для чтения важны только два имени з
 | `scheme` | `system`, `light`, `dark` | у `terminal` всегда тёмная |
 | `accent` | `default`, `blue`, `teal`, `green`, `amber`, `red`, `pink`, `purple` или `#RRGGBB` | |
 | `zoom` | `0.85`, `1`, `1.15`, `1.3`, `1.5` | пишется как `1.3` (не `1.2999999…`); читается с допуском 0,001 |
+| `icon` | `graphite`, `ink`, `night`, `paper`, `dusk`, `indigo`, `dawn`, `ring`, `disc`, `spark` | иконка приложения; `disc` и `spark` применяются только в режиме разработчика (без него вместо них иконка по умолчанию, а выбор остаётся в файле) |
 | `bg.mode` | `default`, `solid`, `gradient`, `media` | `media` без файла в архиве и без сохранённого файла становится `default` |
 | `bg.kind` | `image`, `video` | только подсказка |
 | `bg.color`, `bg.a`, `bg.b` | `#RRGGBB` | |
