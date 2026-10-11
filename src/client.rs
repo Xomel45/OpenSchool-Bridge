@@ -107,6 +107,20 @@ fn parse_country(text: &str) -> Option<String> {
     (code.len() == 2 && code.chars().all(|c| c.is_ascii_alphabetic())).then(|| code.to_ascii_uppercase())
 }
 
+/// TLS for Android: the Mozilla root list that ships with the app and no revocation download (see Cargo.toml).
+#[cfg(target_os = "android")]
+fn android_tls() -> rustls::ClientConfig {
+    let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config
+}
+
 fn build_client(base_url: &str, user_agent: Option<&str>, direct: bool) -> Result<Client, BridgeError> {
     let base_url = reqwest::Url::parse(base_url).map_err(|e| BridgeError::Network(e.to_string()))?;
     check_base_url(&base_url)?;
@@ -119,6 +133,10 @@ fn build_client(base_url: &str, user_agent: Option<&str>, direct: bool) -> Resul
     });
     let jar = Arc::new(Jar::default());
     let mut builder = reqwest::Client::builder().cookie_provider(jar.clone()).redirect(redirects).connect_timeout(CONNECT_TIMEOUT).timeout(REQUEST_TIMEOUT);
+    #[cfg(target_os = "android")]
+    {
+        builder = builder.tls_backend_preconfigured(android_tls());
+    }
     if direct {
         // Ignore the proxy settings of the system and of the environment: a foreign proxy makes Gosuslugi refuse everything.
         builder = builder.no_proxy();

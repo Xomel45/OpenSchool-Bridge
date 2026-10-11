@@ -26,3 +26,9 @@ cli = ["uniffi/cli"]
 opt-level = "z"
 lto = true
 strip = true
+
+# Android: the certificate roots are built in (see `android_tls` in src/client.rs). The system verifier downloads revocation lists
+# while it checks a connection, and where such a list server is slow or blocked every request hung for minutes.
+[target.'cfg(target_os = "android")'.dependencies]
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+webpki-roots = "1"
