@@ -32,7 +32,7 @@ ZIP-архив. Для чтения важны только два имени з
   "zoom": 1.15,
   "icon": "graphite",
   "bg": { "mode": "media", "kind": "image", "color": "#E2E8F0", "a": "#FF9966", "b": "#FF5E62", "angle": 160, "dim": 35, "blur": 0 },
-  "notifications": { "marks": true, "homework": true, "absences": false, "interval_min": 15, "detail": true },
+  "notifications": { "marks": true, "homework": true, "absences": false, "interval_min": 15, "detail": true, "quiet": { "on": false, "from": "22:00", "to": "07:00" } },
   "network": { "mode": "auto" }
 }
 ```
@@ -55,6 +55,8 @@ ZIP-архив. Для чтения важны только два имени з
 | `bg.blur` | 0..20 | размытие картинки |
 | `notifications.marks`, `.homework`, `.absences`, `.detail` | `true` / `false` | |
 | `notifications.interval_min` | `5`, `15`, `30`, `60` | платформа берёт ближайшее из того, что умеет (Android: 15, 30, 60) |
+| `notifications.quiet.on` | `true` / `false` | «Не беспокоить ночью»: в тихие часы уведомления не всплывают (проверка идёт, новое видно в ленте) |
+| `notifications.quiet.from`, `.to` | `"HH:MM"`, 00:00..23:59 | начало (входит) и конец (не входит); может переходить через полночь; одинаковые — тихих часов нет |
 | `network.mode` | `auto`, `direct`, `system` | |
 
 Не переносится (зависит от устройства): «сворачивать в трей», правки режима разработчика, масштаб системы, пути к файлам.

@@ -60,7 +60,11 @@ fn parse_cookie_header(header: &str) -> Vec<SessionCookie> {
 pub struct Client {
     http: reqwest::Client,
     jar: Arc<Jar>,
-    base_url: reqwest::Url,
+    pub(crate) base_url: reqwest::Url,
+    /// For file downloads: no automatic redirects (each hop is checked, see `download.rs`) and no cookie jar (the cookies are
+    /// added by hand, and only for Gosuslugi hosts).
+    pub(crate) dl: reqwest::Client,
+    pub(crate) cookies: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 /// A dead or stalled connection must end with an error, not with a spinner that never stops.
@@ -132,24 +136,27 @@ fn build_client(base_url: &str, user_agent: Option<&str>, direct: bool) -> Resul
         if attempt.url().host_str() == Some(home.as_str()) && attempt.previous().len() < 5 { attempt.follow() } else { attempt.stop() }
     });
     let jar = Arc::new(Jar::default());
-    let mut builder = reqwest::Client::builder().cookie_provider(jar.clone()).redirect(redirects).connect_timeout(CONNECT_TIMEOUT).timeout(REQUEST_TIMEOUT);
-    #[cfg(target_os = "android")]
-    {
-        builder = builder.tls_backend_preconfigured(android_tls());
-    }
-    if direct {
-        // Ignore the proxy settings of the system and of the environment: a foreign proxy makes Gosuslugi refuse everything.
-        builder = builder.no_proxy();
-    }
-    // An empty string means "send no User-Agent header at all".
-    match user_agent.unwrap_or(USER_AGENT) {
-        "" => {}
-        ua => builder = builder.user_agent(ua),
-    }
-    let http = builder
-        .build()
-        .map_err(|e| BridgeError::Network(e.to_string()))?;
-    Ok(Client { http, jar, base_url })
+    // The two clients differ in redirects, cookies and time limits only.
+    let plain = |mut builder: reqwest::ClientBuilder| -> Result<reqwest::ClientBuilder, BridgeError> {
+        #[cfg(target_os = "android")]
+        {
+            builder = builder.tls_backend_preconfigured(android_tls());
+        }
+        if direct {
+            // Ignore the proxy settings of the system and of the environment: a foreign proxy makes Gosuslugi refuse everything.
+            builder = builder.no_proxy();
+        }
+        // An empty string means "send no User-Agent header at all".
+        match user_agent.unwrap_or(USER_AGENT) {
+            "" => {}
+            ua => builder = builder.user_agent(ua),
+        }
+        Ok(builder)
+    };
+    let build = |b: reqwest::ClientBuilder| b.build().map_err(|e| BridgeError::Network(e.to_string()));
+    let http = build(plain(reqwest::Client::builder().cookie_provider(jar.clone()).redirect(redirects).connect_timeout(CONNECT_TIMEOUT).timeout(REQUEST_TIMEOUT))?)?;
+    let dl = build(plain(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).connect_timeout(CONNECT_TIMEOUT).timeout(crate::download::DOWNLOAD_TIMEOUT))?)?;
+    Ok(Client { http, jar, base_url, dl, cookies: std::sync::Mutex::new(Vec::new()) })
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -223,6 +230,9 @@ impl Client {
     pub fn set_session(&self, cookies: Vec<SessionCookie>) {
         for c in cookies.into_iter().filter(plain_cookie) {
             self.jar.add_cookie_str(&format!("{}={}; Path=/", c.name, c.value), &self.base_url);
+            let mut kept = self.cookies.lock().unwrap_or_else(|p| p.into_inner());
+            kept.retain(|(n, _)| *n != c.name);
+            kept.push((c.name, c.value));
         }
     }
 
