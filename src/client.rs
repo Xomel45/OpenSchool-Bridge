@@ -22,7 +22,30 @@ macro_rules! platform { () => { "iOS" }; }
 macro_rules! platform { () => { "Unknown" }; }
 
 /// An honest client identifier, `OpenSchool/<version> (<OS family>; +<repository>)`; we do not pretend to be a browser.
+/// Used until the app says its own version (`set_app_version`).
 const USER_AGENT: &str = concat!("OpenSchool/", env!("CARGO_PKG_VERSION"), " (", platform!(), "; +https://github.com/Xomel45/OpenSchool-Bridge)");
+
+static APP_VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// A version string fit for a header: short, and only digits, letters and `.-+`.
+fn plain_version(v: &str) -> bool {
+    !v.is_empty() && v.len() <= 32 && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b))
+}
+
+/// The app's own version goes first in the User-Agent, the bridge's own after it. Call once at start, before any `Client` is
+/// made; later calls and anything that is not a plain version are ignored. Returns whether this call set it.
+#[uniffi::export]
+pub fn set_app_version(version: String) -> bool {
+    plain_version(&version) && APP_VERSION.set(version).is_ok()
+}
+
+/// `OpenSchool/<app version> (<OS family>; bridge <bridge version>; +<repository>)`, or `USER_AGENT` when the app said nothing.
+fn user_agent_for(app: Option<&str>) -> String {
+    match app {
+        Some(v) => format!("OpenSchool/{v} ({}; bridge {}; +https://github.com/Xomel45/OpenSchool-Bridge)", platform!(), env!("CARGO_PKG_VERSION")),
+        None => USER_AGENT.to_string(),
+    }
+}
 
 /// Where a UI should send the user to log in: Gosuslugi redirects to ESIA and, once the user is
 /// authenticated, lands back on the diary.
@@ -147,9 +170,10 @@ fn build_client(base_url: &str, user_agent: Option<&str>, direct: bool) -> Resul
             builder = builder.no_proxy();
         }
         // An empty string means "send no User-Agent header at all".
-        match user_agent.unwrap_or(USER_AGENT) {
-            "" => {}
-            ua => builder = builder.user_agent(ua),
+        match user_agent {
+            Some("") => {}
+            Some(ua) => builder = builder.user_agent(ua),
+            None => builder = builder.user_agent(user_agent_for(APP_VERSION.get().map(String::as_str))),
         }
         Ok(builder)
     };
@@ -336,6 +360,24 @@ mod tests {
             assert_eq!(super::USER_AGENT, format!("OpenSchool/{} ({os}; +https://github.com/Xomel45/OpenSchool-Bridge)", env!("CARGO_PKG_VERSION")));
         }
         assert!(!super::USER_AGENT.contains("Mozilla"));
+    }
+
+    #[test]
+    fn the_app_version_leads_the_user_agent_and_the_bridge_version_follows() {
+        let ua = super::user_agent_for(Some("2.3.4"));
+        assert!(ua.starts_with("OpenSchool/2.3.4 ("), "{ua}");
+        assert!(ua.contains(&format!("; bridge {}; +https://github.com/Xomel45/OpenSchool-Bridge)", env!("CARGO_PKG_VERSION"))), "{ua}");
+        assert_eq!(super::user_agent_for(None), super::USER_AGENT);
+    }
+
+    #[test]
+    fn only_a_plain_version_may_go_into_the_header() {
+        for ok in ["0.1.0", "1.2.3-beta.1", "1.0.0+git.abc"] {
+            assert!(super::plain_version(ok), "{ok}");
+        }
+        for bad in ["", "1.0\r\nX-Evil: 1", "1.0 (Windows NT 10)", "1;2", &"9".repeat(33)] {
+            assert!(!super::plain_version(bad), "{bad:?}");
+        }
     }
 
     use super::*;

@@ -10,7 +10,7 @@ mod download;
 mod error;
 mod models;
 
-pub use client::{Client, SessionCookie, LOGIN_URL};
+pub use client::{set_app_version, Client, SessionCookie, LOGIN_URL};
 pub use download::{attachment_file_name, can_open, safe_file_name, Download, MAX_DOWNLOAD};
 pub use error::BridgeError;
 pub use models::*;
